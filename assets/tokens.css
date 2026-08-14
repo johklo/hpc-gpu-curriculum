@@ -41,5 +41,7 @@
   --ease-in-out:cubic-bezier(0.65,0,0.35,1);
   --dur-fast:120ms;--dur-mid:200ms;--dur-slow:320ms;
 
-  --rail:19rem;
+  --rail:clamp(15rem,16vw,21rem);
+  --gutter:clamp(1.25rem,2.4vw,3rem);
+  --measure:clamp(60ch,46vw,88ch);
 }
