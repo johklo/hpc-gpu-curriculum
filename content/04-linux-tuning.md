@@ -11,6 +11,10 @@ HPC 워크로드와 어긋나는 지점이 몇 군데 있고, 그 지점을 하�
 
 ## NUMA와 프로세스 배치
 
+NUMA(Non-Uniform Memory Access, 비균일 메모리 접근)는 CPU가 어느 메모리에 접근하느냐에 따라
+속도가 달라지는 구조다. 소켓(socket)은 물리 CPU 하나를 꽂는 자리이고, 큰 서버는 소켓을 둘
+이상 둔다.
+
 소켓이 둘 이상인 서버는 메모리가 소켓마다 붙어 있다. 다른 소켓에 붙은 메모리를 읽으면 지연이
 늘고 대역폭이 준다. GPU와 NIC도 특정 소켓에 연결되어 있어, 프로세스를 어디에 두느냐가 성능을
 바꾼다.
@@ -20,6 +24,25 @@ lscpu | grep -i numa         # 노드 수와 코어 배치
 numactl --hardware           # 노드별 메모리 용량과 노드 간 거리
 nvidia-smi topo -m           # GPU와 NIC이 어느 노드에 붙었는지
 ```
+
+`numactl --hardware`의 출력은 이렇게 읽는다.
+
+```
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 ... 63
+node 0 size: 515000 MB
+node 1 cpus: 64 65 ... 127
+node 1 size: 515000 MB
+node distances:
+node   0   1
+  0:  10  21
+  1:  21  10
+```
+
+`node 0`에 코어 0–63과 약 515GB 메모리가 붙어 있고, `node 1`에 나머지가 붙어 있다는 뜻이다.
+거리 행렬에서 대각선(자기 자신)은 10이고 노드 0에서 노드 1로 가는 값은 21이다. 노드 0의 코어가
+노드 1의 메모리를 읽으면 약 2배 느리다는 근사치다. 프로세스가 쓰는 메모리와 코어를 같은 노드에
+두는 것이 목표다.
 
 `numactl --hardware`의 거리 행렬에서 로컬은 보통 10, 원격은 20 이상이다. 이 값이 실제 지연
 비율의 근사치다.
@@ -191,9 +214,87 @@ sysctl vm.dirty_expire_centisecs    # 얼마나 오래된 데이터부터 내려
 한꺼번에 내려간다. 이 순간 다른 I/O가 전부 밀린다. 값을 낮추면 조금씩 꾸준히 내려가 지연이
 고르게 퍼진다.
 
+`vm.dirty_background_ratio`는 백그라운드로 내려쓰기를 시작하는 문턱이고, `vm.dirty_ratio`는 쓰는
+쪽을 붙잡아 직접 내려쓰게 만드는 문턱이다. 앞의 값을 넘으면 커널이 조용히 뒤에서 내려쓰기
+시작하고, 뒤의 값을 넘으면 쓰던 프로세스가 멈춘 채 버퍼가 빌 때까지 기다린다. 대용량 체크포인트가
+바로 이 뒤 문턱을 넘겨 학습이 몇 초씩 정지하는 원인이다.
+
+효과는 값으로 확인한다. 체크포인트를 쓰는 동안 `/proc/meminfo`의 `Dirty`와 `Writeback`을 지켜본다.
+`Dirty`는 아직 안 내려간 데이터, `Writeback`은 지금 내려가는 중인 데이터다.
+
 ```bash
+grep -E "Dirty|Writeback" /proc/meminfo   # 값이 치솟았다가 한꺼번에 빠지는지 본다
+watch -n1 'grep -E "Dirty|Writeback" /proc/meminfo'
+```
+
+```bash
+sysctl vm.dirty_ratio               # 이 비율을 넘으면 쓰는 쪽이 직접 내려쓴다
+sysctl vm.dirty_background_ratio    # 이 비율부터 백그라운드로 내려쓰기 시작
 sysctl -w vm.dirty_background_ratio=3
 sysctl -w vm.dirty_ratio=10
+# 되돌리기: sysctl -w vm.dirty_background_ratio=10; sysctl -w vm.dirty_ratio=20
+```
+
+메모리가 큰 노드에서는 비율 대신 절대량으로 두는 편이 예측하기 쉽다. `vm.dirty_bytes`와
+`vm.dirty_background_bytes`를 쓰면 메모리 크기와 무관하게 상한이 고정된다. 권장값은 워크로드가
+정하지만, 버퍼가 한 번에 내려가며 멈추는 증상이 보이면 문턱을 낮춰 조금씩 자주 내려가게 만드는
+방향이 맞다.
+
+## GPU 노드에서 특히 문제가 되는 설정
+
+위 항목들이 GPU 학습에서 왜 문제가 되는지는 GPU가 메모리와 네트워크를 쓰는 방식과 연결된다.
+
+**페이지 잠금 메모리(page-locked memory).** GPU로 데이터를 보낼 때 CPU 메모리가 디스크로 밀려나지
+않도록 고정한 영역을 쓴다. 이걸 핀 메모리(pinned memory)라고 부른다. 데이터 로더가
+`pin_memory=True`로 이 영역을 많이 잡는데, 고정된 메모리는 스왑 대상이 아니라서 스왑을 켜 둔
+노드에서도 이 부분은 물리 메모리를 계속 차지한다. 한도가 낮으면 고정에 실패한다.
+
+```bash
+ulimit -l                          # 잠글 수 있는 메모리 한도(KB). unlimited 여야 안전하다
+grep memlock /etc/security/limits.conf
+# 되돌리기: limits.conf 의 해당 줄을 원래대로 두고 다시 로그인한다
+```
+
+**GPUDirect.** GPU가 CPU를 거치지 않고 NIC이나 다른 GPU와 직접 데이터를 주고받는 기능이다.
+GPUDirect RDMA는 네트워크 카드가 GPU 메모리를 바로 읽고, GPUDirect Storage는 저장장치가 GPU
+메모리로 바로 넣는다. CPU를 거치는 복사가 사라져 대역폭이 오르고 지연이 준다. 이 경로는 NIC과
+GPU가 같은 PCIe 스위치 아래, 같은 NUMA 노드에 있을 때 가장 잘 나온다. 앞의 NUMA 배치가 GPU
+노드에서 특히 중요한 까닭이다.
+
+**`vm.max_map_count`.** 한 프로세스가 가질 수 있는 메모리 매핑 영역의 최대 개수다. 기본값
+65530은 큰 학습 프레임워크나 여러 GPU를 쓰는 프로세스에 부족할 때가 있고, 넘으면
+`Cannot allocate memory`나 매핑 실패로 죽는다.
+
+```bash
+sysctl vm.max_map_count             # 기본 65530
+sysctl -w vm.max_map_count=1048576  # 운영 중 바로 적용, 위험 낮음
+# 되돌리기: sysctl -w vm.max_map_count=65530
+```
+
+## 설정별 위험도
+
+설정을 바꾸기 전에 되돌리기가 얼마나 쉬운지 알아야 한다. 운영 중에 바꿔도 되는 것과 재부팅이
+필요한 것, 잘못 두면 노드가 안 뜨는 것을 구분한다.
+
+| 설정 | 되돌리기 | 위험도 |
+| --- | --- | --- |
+| `vm.swappiness`, `vm.dirty_ratio` | `sysctl -w`로 즉시 | 낮음. 운영 중 조정 가능 |
+| I/O 스케줄러 | sysfs에 다시 써서 즉시 | 낮음 |
+| CPU 거버너 | `cpupower`로 즉시 | 낮음 |
+| THP 설정 | sysfs에 다시 써서 즉시 | 낮음 |
+| 인터럽트 affinity | 값 되돌리면 즉시 | 중간. 잘못 묶으면 처리량이 준다 |
+| `vm.max_map_count` | `sysctl -w`로 즉시 | 낮음 |
+| `isolcpus`, `nohz_full` | 부팅 파라미터 수정 후 재부팅 | 높음. 배치를 안 하면 코어가 논다 |
+| C-state 제한 | 부팅 파라미터 수정 후 재부팅 | 중간. 전력이 오른다 |
+| 마운트 옵션 | fstab 수정 후 재마운트 | 중간. 오타면 부팅이 막힐 수 있다 |
+
+`sysctl -w`로 바꾼 값은 재부팅하면 사라진다. 재부팅 후에도 유지하려면 `/etc/sysctl.d/`에
+파일로 남긴다. 부팅 파라미터(`isolcpus` 등)는 잘못 적으면 노드가 정상적으로 뜨지 않으므로, 한
+대에서 재부팅까지 확인한 뒤 나머지에 배포한다.
+
+```bash
+echo 'vm.max_map_count=1048576' > /etc/sysctl.d/90-hpc.conf
+sysctl --system                     # sysctl.d 파일을 다시 읽어 적용한다
 ```
 
 ## 튜닝 프로파일
@@ -215,6 +316,22 @@ tuned-adm profile latency-performance
 cat /usr/lib/tuned/hpc-compute/tuned.conf
 ```
 
+프로파일이 무엇을 바꾸는지 모른 채 적용하면, 나중에 문제가 생겼을 때 원인을 가릴 수 없다.
+`tuned.conf`를 열어 어떤 `sysctl` 값과 거버너, 디스크 설정이 들어 있는지 확인하고 적용한다. 예를
+들어 `latency-performance`는 CPU 거버너를 `performance`로 두고 C-state를 얕게 제한하며 THP를
+조정한다. `hpc-compute`는 여기에 네트워크 버퍼와 커널 스케줄러 설정을 더한다.
+
+```bash
+tuned-adm verify                     # 적용값이 실제 설정과 일치하는지 검사한다
+tuned-adm off                        # 프로파일을 걷어 기본값으로 되돌린다
+```
+
+`tuned-adm verify`는 프로파일이 지정한 값이 실제로 걸려 있는지 확인한다. 다른 스크립트나 사람이
+값을 덮어썼으면 여기서 어긋남이 드러난다. 프로파일과 수동 설정을 섞으면 이 검사가 실패하므로,
+프로파일로 큰 틀을 잡고 정말 필요한 몇 개만 `/etc/sysctl.d/`로 덧붙이는 방식이 관리하기 쉽다.
+노드 종류마다 다른 프로파일이 필요하면 이름을 붙여 관리하고, 어느 노드에 무엇이 걸렸는지
+목록으로 유지한다.
+
 ## 바꾸기 전과 후를 비교
 
 설정을 바꿨으면 효과를 재야 한다. 재현 가능한 부하로 같은 조건에서 비교한다.
@@ -232,6 +349,25 @@ sar -u -r -d -n DEV 1 60 > baseline.txt
 
 값이 좋아지지 않았다면 되돌린다. 설정을 쌓아 두기만 하면 나중에 문제가 생겼을 때 무엇이
 원인인지 가릴 수 없다. 바꾼 항목과 이유, 측정값을 한곳에 기록해 두는 편이 낫다.
+
+비교에는 규칙이 있다. 한 번에 한 항목만 바꾼다. 두 개를 같이 바꾸고 좋아지면 어느 쪽이
+기여했는지 알 수 없다. 같은 부하를 최소 세 번 돌려 중앙값을 쓴다. 한 번의 측정은 캐시 상태나
+이웃 작업 때문에 튄다. 바꾸기 전 값을 baseline으로 저장해 두고, 바꾼 뒤 같은 명령으로 재서
+나란히 놓는다.
+
+```bash
+# 바꾸기 전
+sar -u -r -d -n DEV 1 60 > before.txt
+# 설정 변경 후 동일 부하로
+sar -u -r -d -n DEV 1 60 > after.txt
+sdiff before.txt after.txt | less    # 열을 나란히 놓고 차이를 본다
+```
+
+측정할 지표는 워크로드에 맞춘다. 메모리 대역폭이 중요한 학습은 STREAM 수치를, 통신이 중요한
+분산 학습은 `ib_write_bw`와 NCCL 벤치마크를 본다. 실제 학습의 스텝 시간을 재는 것이 가장
+정확하다. 합성 벤치마크가 좋아져도 학습이 안 빨라지면 그 튜닝은 이 워크로드에 의미가 없다. 바꾼
+항목과 날짜, 이유, 측정값을 노드 종류별로 한 표에 남기면, 몇 달 뒤 성능이 달라졌을 때 무엇을
+건드렸는지 되짚을 수 있다.
 
 ## 다수 노드에 명령 실행
 
@@ -253,3 +389,28 @@ srun --nodes=16 --ntasks-per-node=1 hostname
 
 명령을 배포하기 전에 대상 목록을 먼저 확인하는 습관이 필요하다. 범위를 잘못 적어 전체 노드에
 파괴적인 명령을 보내는 사고가 실제로 일어난다.
+
+도구마다 성격이 조금씩 다르다. 셋을 언제 쓰는지 갈라 둔다.
+
+| 도구 | 성격 | 언제 쓰는가 |
+| --- | --- | --- |
+| `pdsh` | 가벼운 병렬 SSH | 빠른 점검, 한 줄 명령을 전 노드에 |
+| `clush`(ClusterShell) | 노드 그룹과 취합이 강함 | 그룹을 나눠 다루고 결과를 접어서 볼 때 |
+| `srun` | 스케줄러가 할당한 노드에만 | 작업에 실제로 배정된 노드에서 실행할 때 |
+
+`clush`는 노드 그룹을 이름으로 정의해 두고 그룹 단위로 명령을 보낸다. `/etc/clustershell/groups`에
+`gpu: gpu[01-64]`처럼 정의하면 `-g gpu`로 부른다.
+
+```bash
+clush -g gpu 'nvidia-smi --query-gpu=driver_version --format=csv,noheader' | dshbak -c
+clush -bg gpu uptime                # -b 는 같은 출력끼리 묶어 보여준다
+```
+
+`dshbak -c`나 `clush -b`는 출력이 같은 노드를 한 덩어리로 접는다. 64대 중 63대가 같고 1대만
+드라이버 버전이 다르면, 그 1대만 따로 떨어져 나와 바로 눈에 띈다. 점검은 이렇게 "다른 것만
+남기는" 방식이 빠르다.
+
+위험한 명령은 습관으로 막는다. 배포 전에 `clush -g gpu true`나 `pdsh -w ... hostname`으로 대상이
+맞는지 먼저 확인하고, 재부팅이나 삭제처럼 되돌릴 수 없는 명령은 한 노드에서 검증한 뒤 그룹으로
+넓힌다. 범위 표기(`gpu[01-64]`)를 손으로 적을 때 오타 하나가 전 노드로 퍼지므로, 실행 대상을
+출력해 눈으로 확인하는 절차를 건너뛰지 않는다.

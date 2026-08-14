@@ -173,6 +173,41 @@ nvidia-smi -q -d POWER       # 현재 상한과 실제 소비
 전력 상한을 낮추면 성능도 낮아지지만, 비율은 선형이 아니다. 상한을 20퍼센트 낮췄을 때 성능
 저하가 그보다 작다면 랙에 노드를 더 넣는 편이 전체 처리량에서 유리하다.
 
+측정은 같은 작업을 상한만 바꿔 돌려 비교한다. 상한마다 스텝 시간을 재고 실제 소비 전력을 함께
+남긴다.
+
+```bash
+for cap in 700 600 500 400; do
+  srun -N1 --gres=gpu:8 bash -c "
+    nvidia-smi -pl $cap >/dev/null
+    python train.py --max-steps 200 --report-step-time" | tail -1
+done
+```
+
+| 전력 상한 | 스텝 시간 | 성능 비율 | 전력 비율 | 같은 전력에서의 처리량 |
+| ---: | ---: | ---: | ---: | ---: |
+| 700W | 1.00초 | 100% | 100% | 1.00 |
+| 600W | 1.06초 | 94% | 86% | 1.10 |
+| 500W | 1.17초 | 85% | 71% | 1.19 |
+| 400W | 1.42초 | 70% | 57% | 1.23 |
+
+마지막 열이 판단 기준이다. 랙 전력이 상한이고 노드를 더 넣을 여지가 있다면 이 값이 큰 쪽이
+이득이다. 반대로 노드 수가 고정이고 한 작업을 빨리 끝내는 것이 목적이면 상한을 낮출 이유가 없다.
+클러스터가 전력에 묶였는지 자리에 묶였는지부터 정해야 답이 나온다.
+
+메모리 요구량은 사용자가 스스로 알기 어렵다. 지난 실행에서 실제로 얼마를 썼는지 보여 주면
+과다 요청이 줄어든다.
+
+```bash
+# 끝난 작업이 실제로 쓴 GPU 메모리 최댓값
+sacct -j 12345 --format=JobID,ReqTRES%40,MaxRSS,MaxVMSize
+dcgmi stats --job 12345 --verbose | grep -i "memory"
+```
+
+과다 요청은 활용률을 갉아먹는 가장 흔한 원인이다. 80GB 카드를 잡고 12GB만 쓰는 작업이 대기열의
+절반이면, 카드를 늘리는 것보다 요청을 바로잡는 편이 훨씬 싸다. 사용자에게 벌을 주기보다 지난
+실행의 실제 사용량을 작업 종료 메일이나 대시보드에 자동으로 보여 주는 쪽이 효과가 있다.
+
 ## Slurm과 Kubernetes를 함께 쓰기
 
 학습은 Slurm으로, 추론 서비스는 Kubernetes로 운영하는 구성이 흔하다. 문제는 두 스케줄러가 같은
@@ -188,6 +223,24 @@ nvidia-smi -q -d POWER       # 현재 상한과 실제 소비
 
 동적으로 노드를 옮기는 구성은 매력적이지만 상태 전이 중 실패를 다루기가 까다롭다. 처음에는
 물리 분리로 시작하고, 활용률 측정치가 분리 비용을 넘어설 때 옮기는 편이 안전하다.
+
+분리 비용은 계산할 수 있다. 노드를 나누면 각 풀의 대기열이 짧아지는 대신, 한쪽이 놀 때 다른
+쪽이 그 자원을 쓰지 못한다. 하루 단위로 두 풀의 유휴 GPU 시간을 각각 재고, 그 값이 서로
+어긋나는 시간대가 있는지 본다. 학습 수요가 밤에 몰리고 추론 수요가 낮에 몰린다면 옮길 값어치가
+있다. 두 수요의 성수기가 겹치면 옮겨도 얻는 것이 없고 이동 중 유휴 시간만 늘어난다.
+
+```bash
+# Slurm 풀의 유휴 GPU 시간을 하루 단위로 뽑는다
+sreport cluster utilization start=2026-08-01 end=2026-08-08 -t hours
+
+# Kubernetes 풀의 미할당 GPU 수를 같은 기간에 대해 본다
+kubectl get nodes -l pool=inference -o json | \
+  python -c "import json,sys; d=json.load(sys.stdin);
+print(sum(int(n['status']['allocatable'].get('nvidia.com/gpu',0)) for n in d['items']))"
+```
+
+노드를 어떻게 나누고 무엇을 함께 쓰는지, 옮기는 절차를 어떻게 짜는지는 모듈 07의 공존 항목에
+정리해 두었다.
 
 ## 대기열을 나누는 기준
 
@@ -228,6 +281,35 @@ sacct -a -S 2026-01-01 -E now --format=JobID,Account,AllocGRES,Elapsed,State -X 
 sreport cluster Utilization Start=2026-01-01 End=now
 ```
 
+배정만 받고 노는 작업은 두 값을 맞춰 보면 찾아진다. 작업 번호별로 잡은 GPU 수와 그 GPU들의
+실제 사용률을 같이 놓는다.
+
+```bash
+# 지금 도는 작업이 잡은 GPU 수
+squeue -t running -o "%i %u %b %N" -h
+
+# 그 노드들의 GPU 사용률
+srun -w "$(squeue -t running -h -j 12345 -o %N)" --overlap \
+     nvidia-smi --query-gpu=index,utilization.gpu --format=csv,noheader
+```
+
+몇 시간째 사용률이 한 자릿수인 작업은 대개 셋 중 하나다. 대화형 세션을 열어 두고 자리를 비웠거나,
+디버거 앞에서 멈춰 있거나, 데이터를 기다리고 있다. 앞의 둘은 정책으로 줄인다. 대화형 세션에
+짧은 시간 제한을 걸고, 유휴 상태가 일정 시간 이어지면 알림을 보낸다.
+
+목표값은 워크로드 성격에 따라 다르다. 하나의 숫자를 모든 파티션에 들이대면 잘못된 결정을 한다.
+
+| 파티션 성격 | 적당한 할당률 | 이유 |
+| --- | ---: | --- |
+| 대규모 학습 전용 | 85~95% | 큰 작업이 들어갈 빈자리를 남겨 둬야 한다 |
+| 일반 배치 | 90~98% | 백필로 틈을 메울 수 있다 |
+| 대화형과 디버그 | 40~60% | 기다리지 않고 바로 잡히는 것이 목적이다 |
+| 추론 서비스 | 50~70% | 트래픽이 튈 여유를 둬야 한다 |
+
+대화형 파티션의 낮은 활용률을 낭비로 보고 없애면 사용자가 배치 파티션에서 대화형 세션을 열기
+시작한다. 그러면 큰 작업이 들어갈 자리가 사라지고 전체 처리량이 떨어진다. 활용률은 파티션마다
+따로 읽는다.
+
 ## 정책을 바꿀 때
 
 스케줄링 정책을 한 번에 크게 바꾸면 무엇 때문에 달라졌는지 알 수 없게 된다. 하나씩 바꾸고
@@ -239,3 +321,48 @@ sreport cluster Utilization Start=2026-01-01 End=now
 
 사용자에게 알리는 것도 정책의 일부다. 우선순위 규칙이 바뀌면 같은 작업이 어제와 다른 시각에
 시작하는데, 공지 없이 그러면 장애로 오해받는다.
+
+바꾸기 전에 지금 값을 남기고, 무엇을 보고 판단할지 먼저 정한다.
+
+```bash
+scontrol show config > /var/backups/slurm-config-$(date +%F).txt
+sacctmgr dump cluster > /var/backups/slurm-assoc-$(date +%F).cfg
+
+# 최근 2주 대기 시간 분포. 평균이 아니라 분포를 본다
+sacct -a -S now-14days -X -o JobID,Partition,Submit,Start,Elapsed,State \
+      --parsable2 > /tmp/jobs.csv
+```
+
+```python
+import csv, statistics
+from datetime import datetime
+
+waits = []
+with open("/tmp/jobs.csv") as f:
+    for row in csv.DictReader(f, delimiter="|"):
+        if row["Start"] in ("Unknown", "None", ""):
+            continue
+        fmt = "%Y-%m-%dT%H:%M:%S"
+        waits.append((datetime.strptime(row["Start"], fmt)
+                      - datetime.strptime(row["Submit"], fmt)).total_seconds() / 60)
+
+waits.sort()
+print(f"중앙값 {statistics.median(waits):.0f}분  "
+      f"90퍼센타일 {waits[int(len(waits) * 0.9)]:.0f}분  "
+      f"99퍼센타일 {waits[int(len(waits) * 0.99)]:.0f}분")
+```
+
+평균만 보면 소수의 긴 대기가 묻힌다. 불만은 평균이 아니라 상위 백분위에서 나온다. 중앙값이
+줄었는데 99퍼센타일이 늘었다면 그 정책은 다수를 조금 낫게 만들고 소수를 크게 나쁘게 만든 것이다.
+
+| 바꾸는 것 | 효과가 도는 데 걸리는 시간 | 함께 볼 지표 |
+| --- | --- | --- |
+| 파티션 시간 제한 | 즉시 | 백필로 들어간 작업 수, 대기 시간 분포 |
+| fairshare 반감기 | 며칠 | 계정별 사용량 편차 |
+| 우선순위 가중치 | 대기열이 한 바퀴 도는 시간 | 대기 시간 상위 백분위 |
+| 선점 정책 | 즉시 | 선점당한 작업 수와 그중 재시작 실패 수 |
+| QoS 동시 실행 한도 | 즉시 | 특정 사용자의 대기 작업 수 |
+
+한 번에 하나만 바꾸고 최소 한 주는 둔다. 대기열은 주 단위로 패턴이 도는 경우가 많아 하루
+이틀 값으로 판단하면 요일 효과를 정책 효과로 착각한다. 되돌릴 조건도 미리 정해 둔다. 99퍼센타일
+대기가 어느 값을 넘으면 되돌린다는 식으로 숫자를 적어 두면 논쟁이 줄어든다.
