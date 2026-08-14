@@ -103,9 +103,67 @@ PartitionName=train Nodes=gpu[05-16] MaxTime=72:00:00 AllowGroups=ml
 srun python train.py
 ```
 
+![작업은 대기에서 실행으로 가고 정상 종료, 실패, 시간 초과, 노드 장애 중 하나로 끝난다](img/job-states.svg)
+
 `squeue`의 `NODELIST(REASON)` 열이 대기 이유를 알려준다. `Resources`는 자원이 빌 때까지
 기다리는 정상 상태고, `Priority`는 앞에 우선순위가 높은 작업이 있다는 뜻이다.
 `QOSMaxJobsPerUserLimit`처럼 정책 이름이 보이면 한도에 걸린 것이다.
+
+## 작업이 끝난 뒤 확인할 것
+
+작업은 끝나는 방식이 여러 가지이고, 그때마다 볼 곳이 다르다.
+
+| 상태 | 뜻 | 확인할 것 |
+| --- | --- | --- |
+| `COMPLETED` | 정상 종료 | 없음 |
+| `FAILED` | 종료 코드가 0이 아니다 | 애플리케이션 로그 |
+| `TIMEOUT` | 요청 시간을 넘겼다 | `--time` 설정, 실제 소요 시간 |
+| `OUT_OF_MEMORY` | 메모리 한도 초과 | `MaxRSS`와 요청량 |
+| `NODE_FAIL` | 노드가 빠졌다 | 그 노드의 상태와 로그 |
+| `CANCELLED` | 취소됐다 | 누가 취소했는지, 관리자 조치인지 |
+
+```bash
+sacct -j 12345 --format=JobID,JobName,State,ExitCode,MaxRSS,ReqMem,Elapsed,Timelimit,NodeList
+```
+
+`ExitCode`는 두 값이 콜론으로 이어진다. 앞은 프로세스 종료 코드, 뒤는 받은 신호 번호다.
+`0:9`면 SIGKILL을 받은 것이고 `0:15`면 SIGTERM이다. 시간 초과로 스케줄러가 죽인 경우가 흔하다.
+
+`MaxRSS`가 요청 메모리에 근접했다면 다음 제출에서 늘린다. 반대로 요청량의 10퍼센트만 썼다면
+줄이는 편이 낫다. 과하게 요청하면 자기 작업이 대기열에서 밀린다.
+
+## 재현 가능한 작업 만들기
+
+같은 스크립트가 어제는 됐는데 오늘은 안 되는 상황은 대부분 환경 차이에서 온다. 작업
+스크립트가 사용자 셸 설정에 기대지 않게 만들면 이 문제가 크게 준다.
+
+```bash
+#!/bin/bash
+#SBATCH ...
+
+set -euo pipefail            # 실패를 조용히 넘기지 않는다
+module purge                 # 셸에 남아 있던 모듈을 내린다
+module load cuda/12.4 nccl/2.21
+
+echo "host=$(hostname) job=$SLURM_JOB_ID"    # 나중에 조사할 근거를 남긴다
+nvidia-smi --query-gpu=index,name,driver_version --format=csv
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+
+srun python train.py
+```
+
+앞부분의 몇 줄이 로그에 남아 있으면 나중에 문제를 조사할 때 시간을 크게 줄인다. 어떤 노드에서
+어떤 드라이버와 어떤 라이브러리 버전으로 돌았는지가 곧 단서다.
+
+## 자주 하는 제출 실수
+
+| 증상 | 원인 | 고치는 법 |
+| --- | --- | --- |
+| 계속 `PENDING` | 요청이 어떤 노드보다도 크다 | `sinfo -o "%n %c %m %G"` 로 실제 사양 확인 |
+| GPU가 안 보인다 | `--gres` 를 빼먹었다 | `--gres=gpu:N` 추가 |
+| 프로세스가 하나만 뜬다 | `python` 을 직접 실행했다 | `srun python` 으로 실행 |
+| 데이터 로더가 느리다 | `--cpus-per-task` 가 작다 | GPU당 8~16코어를 잡는다 |
+| 로그가 안 남는다 | 출력 경로의 디렉터리가 없다 | 제출 전에 `mkdir -p logs` |
 
 ## MPI로 노드를 넘어 계산하기
 
