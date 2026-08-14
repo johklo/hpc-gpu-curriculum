@@ -209,7 +209,7 @@ journalctl -p err -S "1 hour ago"      # 최근 한 시간의 오류만
 
 `dmesg`에서 `Out of memory: Killed process`가 보이면 커널이 프로세스를 죽인 것이다. 작업이
 아무 메시지 없이 사라졌다는 신고의 상당수가 여기에 해당한다. `Xid`로 시작하는 줄이 보이면 GPU
-문제이고, 모듈 07에서 다룬다.
+문제이고, 모듈 08에서 이어 본다.
 
 작업 단위로는 Slurm의 기록을 본다.
 
@@ -219,6 +219,50 @@ sacct -j 12345 --format=JobID,State,ExitCode,MaxRSS,Elapsed
 
 `ExitCode`가 `0:9`면 SIGKILL, `0:15`면 SIGTERM이다. 시간 초과로 스케줄러가 죽인 경우
 `State`가 `TIMEOUT`으로 남는다. `MaxRSS`가 요청한 메모리에 근접했다면 메모리 부족을 의심한다.
+
+로그를 볼 때 시각을 맞추는 것이 중요하다. `dmesg`는 기본적으로 부팅 후 경과 시간을 찍으므로
+`-T`를 붙여 실제 시각으로 바꿔야 다른 로그와 나란히 놓을 수 있다. 노드마다 시간이 어긋나 있으면
+인과가 뒤집혀 보이므로 시간 동기화부터 확인한다.
+
+```bash
+timedatectl status | grep -E "synchronized|NTP"
+chronyc tracking | head -3            # 기준 서버와의 오차
+```
+
+어느 로그에서 무엇이 나오는지 알아 두면 찾는 시간이 준다.
+
+| 증상 | 볼 곳 | 찾을 문자열 |
+| --- | --- | --- |
+| 작업이 조용히 사라졌다 | `dmesg -T` | `Out of memory`, `Killed process` |
+| GPU가 사라졌다 | `dmesg -T` | `NVRM: Xid`, `GPU has fallen off the bus` |
+| 노드가 대기열에서 빠졌다 | `journalctl -u slurmd` | `error`, `Node ... not responding` |
+| 작업이 시작되지 않는다 | `journalctl -u slurmctld` | `job_id`, `Requeue` |
+| 파일 접근이 실패한다 | `dmesg -T` | `Lustre`, `evicted`, `nfs: server` |
+| 네트워크가 끊긴다 | `dmesg -T` | `link is down`, `mlx5_core` |
+
+여러 노드에 걸친 문제는 한 대만 봐서는 모른다. 같은 시각의 로그를 여러 노드에서 한 번에 모아
+비교하면 공통 원인이 드러난다. 노드마다 다른 메시지가 나온다면 노드 개별 문제이고, 같은 시각에
+같은 메시지가 나온다면 공통 설비를 의심한다.
+
+```bash
+# 문제가 난 노드들에서 같은 구간의 커널 로그를 한꺼번에 모은다
+pdsh -w gpu[07-18] 'dmesg -T | grep -i -E "xid|error|down" | tail -5' | sort
+
+# 스위치나 스토리지처럼 공통 설비가 원인이면 시각이 겹친다
+pdsh -w gpu[07-18] 'journalctl -p err -S "02:00" -U "03:00" --no-pager | head -3' | dshbak -c
+```
+
+로그를 오래 남기는 것도 준비의 일부다. 기본 설정에서는 재부팅하면 커널 로그가 사라지므로,
+장애 직후에 노드를 재부팅하면 증거가 함께 없어진다. `journald`를 디스크에 저장하도록 두고
+보존 용량을 정해 둔다.
+
+```bash
+# /etc/systemd/journald.conf
+# Storage=persistent
+# SystemMaxUse=2G
+journalctl --disk-usage
+journalctl --list-boots | head           # 지난 부팅의 로그가 남아 있는지
+```
 
 ## GPU 자원 관리
 

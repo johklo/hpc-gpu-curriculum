@@ -31,6 +31,34 @@ def slug(text: str) -> str:
     return re.sub(r"\s+", "-", text) or "section"
 
 
+def split_sections(raw: str) -> tuple[str, list]:
+    """Split on `## ` headings, ignoring any that sit inside a fenced code block.
+
+    Documents legitimately contain fenced Markdown samples whose own headings would
+    otherwise be mistaken for section boundaries.
+    """
+    intro: list[str] = []
+    sections: list[dict] = []
+    current: dict | None = None
+    fenced = False
+
+    for line in raw.split("\n"):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        elif not fenced:
+            match = re.match(r"## +(.+)$", line)
+            if match:
+                title = match.group(1).strip()
+                current = {"title": title, "id": slug(title), "lines": []}
+                sections.append(current)
+                continue
+        (current["lines"] if current else intro).append(line)
+
+    for section in sections:
+        section["body"] = "\n".join(section.pop("lines")).strip()
+    return "\n".join(intro).strip(), sections
+
+
 def parse(path: Path) -> dict:
     raw = path.read_text(encoding="utf-8")
     meta: dict[str, str] = {}
@@ -41,11 +69,7 @@ def parse(path: Path) -> dict:
                 key, _, value = line.partition(":")
                 meta[key.strip()] = value.strip().strip('"')
 
-    parts = re.split(r"^## +(.+)$", raw, flags=re.MULTILINE)
-    sections = []
-    for index in range(1, len(parts), 2):
-        title = parts[index].strip()
-        sections.append({"title": title, "id": slug(title), "body": parts[index + 1].strip()})
+    intro, sections = split_sections(raw)
 
     return {
         "file": path.name,
@@ -54,7 +78,7 @@ def parse(path: Path) -> dict:
         "title": meta.get("title", path.stem),
         "subtitle": meta.get("subtitle", ""),
         "level": meta.get("level", ""),
-        "intro": parts[0].strip(),
+        "intro": intro,
         "sections": sections,
     }
 

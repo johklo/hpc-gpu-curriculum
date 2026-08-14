@@ -57,13 +57,18 @@
 
   // 문서 전체에서 해당 문단의 본문 구간만 찾아 바꾼다. 저장 직전에 최신 파일을 다시
   // 받아오므로 다른 사람이 먼저 고친 내용을 덮어쓰지 않는다.
+  // Headings inside fenced code blocks are content, not section boundaries.
+  function isHeading(line) { return /^##\s+/.test(line); }
+
   function replaceSection(source, heading, body) {
     var lines = source.split("\n");
-    var start = -1, end = lines.length;
+    var start = -1, end = lines.length, fenced = false;
     for (var i = 0; i < lines.length; i++) {
+      if (/^\s*```/.test(lines[i])) { fenced = !fenced; continue; }
+      if (fenced) continue;
       if (start === -1) {
-        if (lines[i].replace(/^##\s+/, "") === heading && /^##\s+/.test(lines[i])) start = i + 1;
-      } else if (/^##\s+/.test(lines[i])) { end = i; break; }
+        if (isHeading(lines[i]) && lines[i].replace(/^##\s+/, "").trim() === heading) start = i + 1;
+      } else if (isHeading(lines[i])) { end = i; break; }
     }
     if (start === -1) return null;
     return lines.slice(0, start).concat("", body.trim(), "").concat(lines.slice(end)).join("\n");

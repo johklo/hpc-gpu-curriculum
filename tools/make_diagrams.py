@@ -458,6 +458,137 @@ def node_states() -> None:
     write("node-states.svg", p)
 
 
+def automation_flow() -> None:
+    """The order a new node is brought up, and where each step can stop the line."""
+    w, h = 900, 430
+    p = head(w, h, "노드 한 대를 클러스터에 넣기까지",
+             "새 노드는 정해진 순서로 준비된다. 각 단계마다 검증이 붙고, 검증에 실패하면 "
+             "다음으로 넘기지 않고 멈춘다. 마지막에야 스케줄러가 작업을 보낸다.")
+    p.append(title_line("노드 한 대를 클러스터에 넣기까지"))
+
+    steps = [
+        ("기본 설정", "커널 · 시간 · 계정"),
+        ("마운트", "공유 파일시스템"),
+        ("드라이버", "GPU · IB"),
+        ("에이전트", "지표 · 로그 수집"),
+        ("스케줄러 등록", "노드로 편입"),
+    ]
+    x = 24
+    for index, (name, note) in enumerate(steps):
+        p.append(box(x, 74, 152, 60, [strong(name, 12), small(note, 9)],
+                     fill=C["accentBg"], stroke=C["accent"]))
+        p.append(box(x, 156, 152, 40, [small("검증", 10, C["ink"])], fill=C["warnBg"], stroke=C["warn"]))
+        p.append(line(x + 76, 136, x + 76, 154, colour=C["warn"], marker="w", width=1.5))
+        if index < len(steps) - 1:
+            p.append(line(x + 154, 104, x + 198, 104, colour=C["ink2"], marker="b"))
+        x += 202
+
+    p.append(f'<path d="M 100 198 C 100 244, 802 244, 802 214" fill="none" stroke="{C["danger"]}" '
+             f'stroke-width="1.8" stroke-dasharray="5 4"/>')
+    p.append(txt(450, 268, "검증에 실패하면 다음 단계로 넘기지 않는다. 반쯤 준비된 노드가 대기열에 들어가는 것이 가장 나쁘다.",
+                 size=11, colour=C["danger"], anchor="middle"))
+
+    p.append(box(24, 296, 354, 54, [strong("멱등성", 12), small("몇 번 돌려도 결과가 같다", 9)]))
+    p.append(box(400, 296, 354, 54, [strong("검증 포함", 12), small("바꾼 뒤 확인까지 한 묶음이다", 9)]))
+
+    p.append(rule(24, 374, 876))
+    p.append(txt(24, 396, "손으로 한 번 고친 노드는 다음 배포에서 원래대로 돌아온다. 예외를 두려면 코드에 적어야 남는다.", size=11))
+    p.append(txt(24, 416, "먼저 한 대에만 적용하고, 검증이 통과하면 몇 대씩 나눠 넓힌다. 전체에 한 번에 거는 배포는 두지 않는다.", size=11))
+    write("automation-flow.svg", p)
+
+
+def observability_stack() -> None:
+    """Where each signal comes from and where it ends up."""
+    w, h = 900, 490
+    p = head(w, h, "지표와 로그가 흘러가는 길",
+             "노드와 GPU와 스케줄러에서 나온 지표는 수집기를 거쳐 시계열 저장소로, 로그는 별도 "
+             "경로로 모인다. 화면과 알림은 같은 저장소를 본다.")
+    p.append(title_line("지표와 로그가 흘러가는 길"))
+
+    sources = [
+        ("노드", "node_exporter", "CPU · 메모리 · 디스크"),
+        ("GPU", "dcgm-exporter", "사용률 · 온도 · XID"),
+        ("스케줄러", "slurm-exporter", "대기 · 할당 · 노드 상태"),
+        ("작업", "학습 코드", "스텝 시간 · 로더 대기"),
+    ]
+    y = 68
+    for name, agent, what in sources:
+        p.append(box(24, y, 200, 50, [strong(name, 12), small(agent, 9)], fill=C["accentBg"], stroke=C["accent"]))
+        p.append(txt(232, y + 16, what, size=10, colour=C["muted"], mid=True))
+        p.append(line(226, y + 25, 396, y + 25, width=1.5))
+        y += 58
+
+    p.append(box(400, 68, 180, 214, [strong("Prometheus", 12), small(""), small("긁어서 모은다"),
+                                     small("보존 기간을 정한다")], fill=C["bg"]))
+    p.append(box(24, 306, 344, 68, [strong("로그", 12), small("promtail · slurmctld · dmesg · 작업 출력", 9)]))
+    p.append(box(400, 306, 180, 68, [strong("Loki", 12), small("같은 라벨을 붙인다", 9)], fill=C["bg"]))
+    p.append(line(370, 340, 396, 340, width=1.5))
+
+    p.append(box(640, 68, 236, 88, [strong("대시보드", 12), small("보는 사람마다 다른 화면", 9)],
+                 fill=C["accentBg"], stroke=C["accent"]))
+    p.append(box(640, 178, 236, 88, [strong("알림", 12), small("정상 범위를 벗어날 때만", 9)],
+                 fill=C["warnBg"], stroke=C["warn"]))
+    p.append(box(640, 306, 236, 68, [strong("장애 리포트", 12), small("그래프와 로그를 근거로", 9)]))
+    p.append(line(584, 112, 636, 112, width=1.5))
+    p.append(line(584, 208, 636, 208, colour=C["warn"], marker="w", width=1.5))
+    p.append(line(584, 340, 636, 340, width=1.5))
+
+    p.append(rule(24, 400, 876))
+    p.append(txt(24, 422, "지표는 무엇이 언제 이상했는지 알려주고, 로그는 그 순간의 이유를 준다. 둘을 작업 번호로 이어야 오갈 수 있다.", size=11))
+    p.append(txt(24, 444, "라벨을 잘게 쪼갤수록 시계열 개수가 곱으로 늘어난다. 저장 비용이 터지는 원인은 대개 수집 대상이 아니라 라벨이다.", size=11))
+    p.append(txt(24, 466, "알림은 사람이 지금 손댈 수 있는 것에만 건다. 손댈 수 없는 알림은 무시하는 습관을 만든다.", size=11))
+    write("observability-stack.svg", p)
+
+
+def cost_stack() -> None:
+    """Where the money in a GPU hour actually goes."""
+    w, h = 900, 400
+    p = head(w, h, "GPU 한 시간의 원가 구성",
+             "장비 감가가 절반을 넘지만 전력과 냉각과 운영이 나머지를 채운다. 가동률이 떨어지면 "
+             "같은 비용을 더 적은 시간으로 나누게 되어 실사용 단가가 오른다.")
+    p.append(title_line("GPU 한 시간의 원가는 어디로 가는가"))
+
+    items = [
+        ("장비 감가", 7500, C["accent"]),
+        ("전력", 1050, C["warn"]),
+        ("운영 인력", 800, C["ink2"]),
+        ("스토리지", 600, C["ink2"]),
+        ("네트워크", 500, C["ink2"]),
+        ("냉각", 400, C["warn"]),
+        ("상면", 300, C["ink2"]),
+    ]
+    total = sum(v for _, v, _ in items)
+    x = 24
+    for name, value, colour in items:
+        width = round(852 * value / total)
+        p.append(f'<rect x="{x}" y="72" width="{width}" height="46" fill="{C["white"]}" '
+                 f'stroke="{colour}" stroke-width="1.5"/>')
+        if width > 78:
+            p.append(txt(x + width / 2, 95, name, size=10, colour=C["ink"], anchor="middle", mid=True))
+        x += width
+
+    y = 150
+    for name, value, colour in items:
+        p.append(txt(24, y, name, size=11, colour=C["ink2"]))
+        p.append(txt(300, y, f"연 {value:,}만 원", size=11, colour=colour, anchor="end"))
+        p.append(txt(400, y, f"{value / total * 100:4.1f}%", size=11, colour=C["muted"], anchor="end"))
+        y += 22
+
+    p.append(box(470, 146, 406, 158, [
+        strong("가동률이 단가를 정한다", 12),
+        small(""),
+        small("가동률 40%  ·  시간당 3,980원"),
+        small("가동률 60%  ·  시간당 2,650원"),
+        small("가동률 80%  ·  시간당 1,990원"),
+        small("가동률 95%  ·  시간당 1,670원"),
+    ], fill=C["warnBg"], stroke=C["warn"]))
+
+    p.append(rule(24, 330, 876))
+    p.append(txt(24, 352, "가동률을 60%에서 80%로 올리면 GPU를 25% 더 사는 것과 같은 효과가 난다. 장비를 늘리기 전에 활용률부터 본다.", size=11))
+    p.append(txt(24, 372, "전력과 냉각을 합치면 감가 다음으로 크다. 랙 전력이 상한인 곳에서는 이 항목이 증설 가능 여부까지 정한다.", size=11))
+    write("cost-stack.svg", p)
+
+
 if __name__ == "__main__":
     print("그림을 그린다")
     llm_io_traffic()
@@ -468,4 +599,7 @@ if __name__ == "__main__":
     memory_hierarchy()
     gpu_node_anatomy()
     node_states()
+    automation_flow()
+    observability_stack()
+    cost_stack()
     print("끝")

@@ -467,6 +467,113 @@ lfs quota -g team-ml /scratch
 용량과 대역폭은 따로 잡는다는 점을 기억한다. 500 TB가 필요하다고 500 TB짜리를 사면 대역폭이
 모자라고, 20 GB/s가 필요하다고 그 값만 보면 용량이 모자란다. 둘 중 큰 쪽이 서버 대수를 정한다.
 
+## 객체 스토리지를 계층으로 두기
+
+병렬 파일시스템은 비싸다. 용량 단가로 보면 객체 스토리지가 몇 배 싸기 때문에, 원본 데이터는
+객체 스토리지에 두고 학습에 쓰는 것만 병렬 파일시스템으로 올리는 계층 구성이 늘고 있다.
+
+| 계층 | 무엇을 두나 | 성격 |
+| --- | --- | --- |
+| 객체 스토리지 | 원본 데이터, 지난 체크포인트, 결과물 | 용량이 싸다. POSIX가 아니다 |
+| 병렬 파일시스템 | 지금 도는 학습이 읽는 데이터, 최근 체크포인트 | 빠르다. 비싸다 |
+| 노드 로컬 NVMe | 반복해 읽는 샤드 | 가장 빠르다. 작업이 끝나면 사라진다 |
+
+자체 구축에서 객체 스토리지를 올리는 방법은 두 갈래다. MinIO는 설치가 가볍고 S3 규약을 그대로
+따르므로 작은 규모에서 빠르게 세운다. Ceph는 객체와 블록과 파일을 함께 제공하고 RADOS
+Gateway가 S3 창구 역할을 한다. 운영 난도는 높지만 규모가 커질수록 유리하다.
+
+```bash
+# 객체 스토리지에서 학습 데이터를 병렬 파일시스템으로 올린다
+mc alias set store https://s3.internal ACCESS SECRET
+mc mirror --overwrite store/datasets/imagenet-shards /scratch/dataset/
+
+# 끝난 실험의 체크포인트를 내려 용량을 비운다
+mc mv --recursive /scratch/run-41/checkpoints store/archive/run-41/
+```
+
+객체 스토리지는 POSIX가 아니라는 점이 중요하다. 파일을 부분만 고쳐 쓸 수 없고, 디렉터리도
+실제로는 이름 앞부분일 뿐이다. 학습 코드가 `open()`과 `seek()`을 그대로 쓰고 있다면 객체
+스토리지를 직접 읽게 만들 수 없다. 세 가지 선택지가 있다.
+
+- **미리 내려받는다.** 작업 시작 시 필요한 샤드만 로컬이나 공유 파일시스템으로 옮긴다. 가장
+  단순하고 성능이 예측된다. 데이터가 크면 시작이 오래 걸린다.
+- **읽기 라이브러리를 쓴다.** WebDataset이나 각 프레임워크의 S3 데이터셋 구현이 객체를 스트림
+  으로 읽는다. 코드를 고쳐야 하지만 내려받기가 사라진다.
+- **파일시스템처럼 붙인다.** s3fs 같은 도구로 마운트한다. 코드를 안 고쳐도 되지만 메타데이터
+  요청마다 네트워크를 타므로 작은 파일이 많으면 느리다. 학습 데이터 경로에는 권하지 않는다.
+
+```python
+# 객체 스토리지의 샤드를 스트림으로 읽는 구성
+import webdataset as wds
+
+url = "pipe:mc cat store/datasets/imagenet-{000000..000999}.tar"
+dataset = wds.WebDataset(url, shardshuffle=True).decode("pil")
+```
+
+계층 사이를 옮기는 일은 정책으로 자동화한다. 마지막 접근이 30일을 넘긴 데이터셋과 두 세대 이전
+체크포인트를 객체 스토리지로 내리는 규칙을 두면 병렬 파일시스템 용량 경보가 크게 준다.
+
+```bash
+# 30일 이상 손대지 않은 데이터셋을 찾아 내린다
+lfs find /scratch/dataset -atime +30 -type d -maxdepth 1
+```
+
+## 컨테이너에서 공유 스토리지 붙이기
+
+Kubernetes 쪽 워크로드도 같은 데이터를 봐야 한다. 노드에 이미 마운트된 경로를 그대로 붙이는
+방식이 가장 단순하다.
+
+```yaml
+volumes:
+  - name: scratch
+    hostPath: { path: /scratch, type: Directory }
+```
+
+단순한 대신 파드가 노드의 마운트 상태에 그대로 묶인다. 마운트가 빠진 노드에 파드가 뜨면 빈
+디렉터리를 보고 조용히 잘못된 결과를 낸다. 규모가 커지면 CSI 드라이버로 정식 볼륨으로 다루는
+편이 낫다. 볼륨이 준비되지 않으면 파드가 아예 뜨지 않으므로 조용한 실패가 사라진다.
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: scratch-lustre
+spec:
+  capacity: { storage: 500Ti }
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: lustre.csi.example.com
+    volumeHandle: scratch
+    volumeAttributes:
+      mgsAddress: 10.0.0.10@o2ib
+      fsName: scratch
+```
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scratch
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: scratch-lustre
+  resources:
+    requests: { storage: 500Ti }
+```
+
+| 방식 | 좋은 점 | 나쁜 점 |
+| --- | --- | --- |
+| hostPath | 설정이 없다. 성능 손실도 없다 | 마운트 누락을 파드가 모른다. 권한 통제가 없다 |
+| CSI 정적 볼륨 | 볼륨이 없으면 파드가 안 뜬다. 접근 제어가 붙는다 | 드라이버 설치와 관리가 필요하다 |
+| CSI 동적 프로비저닝 | 사용자가 알아서 잡는다 | 병렬 파일시스템에서는 잘 쓰지 않는다 |
+| 객체 스토리지 직접 | 스토리지 계층이 필요 없다 | POSIX가 아니라 코드를 고쳐야 한다 |
+
+접근 권한은 파일시스템의 uid로 매겨진다는 점을 다시 확인한다. CSI로 붙여도 파드가 root로 돌면
+Slurm 쪽에서 만든 파일과 권한이 어긋난다. `securityContext`에 실제 uid를 지정해야 양쪽이 같은
+파일을 다룬다.
+
 ## 성능 재기
 
 체감으로 판단하지 말고 도구로 잰다. 대역폭과 메타데이터를 따로 재야 어디가 막혔는지 갈린다.
