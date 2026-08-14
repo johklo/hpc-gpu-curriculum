@@ -46,6 +46,38 @@ level: 실무
 느린 학습 하나를 잡고 그 작업의 GPU 사용률과 그 작업이 남긴 로그를 바로 오갈 수 있다. 이
 연결을 처음부터 설계에 넣는 것이 관측 체계의 값을 좌우한다.
 
+세 재료를 한 규약으로 다루려는 표준이 OpenTelemetry다. 계측 방식과 전송 형식을 정해 두고,
+수집기가 받아서 원하는 저장소로 나눠 보낸다. GPU 클러스터에서 당장 필요한 물건은 아니지만,
+추론 서빙이나 데이터 파이프라인처럼 여러 단계를 거치는 워크로드를 함께 운영한다면 값어치가
+나온다. 학습 쪽 지표는 이미 각 수집기가 프로메테우스 형식으로 내보내므로 그대로 두고, 새로
+붙이는 서비스 계층에만 적용하는 식으로 나눠 쓰는 구성이 무난하다.
+
+```yaml
+# 수집기 하나가 여러 형식을 받아 각각의 저장소로 보낸다
+receivers:
+  otlp:
+    protocols: { grpc: { endpoint: 0.0.0.0:4317 } }
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: dcgm
+          static_configs: [{ targets: ["gpu07:9400"] }]
+
+exporters:
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+  otlphttp/logs:
+    endpoint: http://loki:3100/otlp
+
+service:
+  pipelines:
+    metrics: { receivers: [otlp, prometheus], exporters: [prometheusremotewrite] }
+    logs: { receivers: [otlp], exporters: [otlphttp/logs] }
+```
+
+층을 하나 더 두는 만큼 장애가 났을 때 확인할 곳도 하나 늘어난다. 수집기가 죽으면 지표가 통째로
+비므로, 수집기 자신의 상태도 감시 대상에 넣는다.
+
 ## 무엇을 모을 것인가
 
 클러스터는 여러 층으로 쌓여 있고, 층마다 봐야 할 지표와 적당한 수집 주기가 다르다. 빠르게

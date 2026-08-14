@@ -460,6 +460,51 @@ sinfo -o "%n %c %m %G"     # 노드 이름, 코어 수, 메모리, GRES(gpu 수)
 크게 잡으면 빈 노드를 오래 기다린다. 첫 제출에서는 넉넉히 잡아 완주시킨 뒤, `sacct`의 `MaxRSS`를
 보고 실제 사용량에 맞춰 줄이는 순서가 안전하다.
 
+## 손에 클러스터가 없을 때
+
+Slurm을 익히려고 클러스터를 기다릴 필요는 없다. 컨테이너로 노트북 위에 작은 클러스터를 세워
+명령과 스크립트를 그대로 연습할 수 있다. GPU는 없지만 제출, 대기열, 의존성, 배열 작업 같은
+동작은 실제와 같다.
+
+```bash
+# 컨트롤러 한 대와 컴퓨트 두 대를 띄운다
+git clone https://github.com/giovtorres/slurm-docker-cluster
+cd slurm-docker-cluster
+docker compose up -d
+docker compose exec slurmctld bash        # 로그인 노드에 들어간 셈이다
+```
+
+```bash
+# 안에서 평소처럼 쓴다
+sinfo
+srun -N2 hostname
+sbatch --wrap 'sleep 30; echo done'
+squeue
+sacct
+```
+
+macOS에서 Docker Desktop을 쓰지 않는다면 colima로 런타임만 띄워도 된다. 리눅스 가상 머신 하나를
+올려 그 위에서 컨테이너를 돌리는 방식이라 동작은 같다.
+
+```bash
+brew install colima docker docker-compose
+colima start --cpu 4 --memory 8
+docker compose up -d
+```
+
+연습용 클러스터에서 확인할 수 있는 것과 없는 것을 구분해 둔다.
+
+| 확인되는 것 | 확인되지 않는 것 |
+| --- | --- |
+| 제출과 대기열 동작 | GPU 자원 요청과 배치 |
+| 스크립트 문법과 환경 변수 | 노드 간 고속 통신 |
+| 의존성과 배열 작업 | 공유 파일시스템 성능 |
+| 파티션과 시간 제한 정책 | 실제 대기 시간과 경합 |
+| `sacct` 기록 읽기 | 하드웨어 장애 상황 |
+
+스크립트를 여기서 다듬고 실제 클러스터에서는 자원 요청만 바꿔 제출하면 실수가 준다. 특히 처음
+쓰는 사람이 `#SBATCH` 지시어를 잘못 적어 겪는 실패는 대부분 여기서 미리 걸러진다.
+
 ## MPI로 노드를 넘어 계산하기
 
 한 노드 안에서는 스레드로 병렬화하면 되지만 노드를 넘어가면 메모리가 공유되지 않는다.

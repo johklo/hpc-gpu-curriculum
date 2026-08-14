@@ -392,6 +392,85 @@ sbatch --constraint=h100 --nodes=4 train.sh    # H100 노드에서만 4대를 �
 템플릿에 타입과 제약을 기본으로 박아, 사용자가 빠뜨려 섞이는 사고를 코드로 막는다. GPU와 NPU가
 섞인 클러스터는 프레임워크 자체가 다른 경우가 많아, 아예 다른 대기열로 갈라 두는 편이 낫다.
 
+## 워크플로로 단계를 잇기
+
+학습 한 번은 대개 작업 하나가 아니다. 데이터를 받고, 전처리하고, 학습하고, 평가하고, 결과를
+옮기는 단계가 이어진다. 각 단계는 필요한 자원도 걸리는 시간도 다르다.
+
+| 단계 | 필요한 것 | 걸리는 시간 |
+| --- | --- | --- |
+| 데이터 수집 | CPU와 네트워크. GPU는 필요 없다 | 수십 분 |
+| 전처리와 샤딩 | CPU 여러 노드 | 수 시간 |
+| 학습 | GPU 수십에서 수백 장 | 며칠에서 몇 주 |
+| 평가 | GPU 몇 장 | 수십 분 |
+| 결과 이관 | 네트워크 | 수십 분 |
+
+전부를 GPU 작업 하나로 묶으면 전처리하는 몇 시간 동안 GPU가 논다. 단계를 나눠 제출하고 순서만
+잇는 편이 자원을 아낀다. Slurm은 이 일을 의존성으로 한다.
+
+```bash
+prep=$(sbatch --parsable --partition=cpu prep.sh)
+train=$(sbatch --parsable --dependency=afterok:$prep --gres=gpu:8 train.sh)
+eval=$(sbatch --parsable --dependency=afterok:$train --gres=gpu:1 eval.sh)
+sbatch --dependency=afterany:$eval --partition=cpu report.sh
+```
+
+| 의존 형태 | 언제 시작하나 |
+| --- | --- |
+| `afterok` | 앞 작업이 성공으로 끝났을 때 |
+| `afternotok` | 앞 작업이 실패했을 때. 정리나 알림에 쓴다 |
+| `afterany` | 성공이든 실패든 끝났을 때 |
+| `after` | 앞 작업이 시작만 하면 |
+| `singleton` | 같은 이름의 내 작업이 없을 때. 중복 제출을 막는다 |
+
+의존성만으로는 부족한 경우가 있다. 단계가 열 개를 넘거나, 조건에 따라 갈라지거나, 매일 정해진
+시각에 돌아야 하거나, 실패한 단계만 다시 돌려야 할 때다. 이때는 워크플로 도구를 얹는다.
+
+| 도구 | 성격 | HPC와 잇는 방법 |
+| --- | --- | --- |
+| Airflow | 시각 기반 실행과 재시도에 강하다 | DAG의 태스크가 `sbatch` 하고 상태를 기다린다 |
+| Kubeflow Pipelines | 컨테이너 단위로 단계를 엮는다 | Kubernetes 쪽 자원을 그대로 쓴다 |
+| Argo Workflows | Kubernetes 원생. 가볍다 | 파드로 단계를 돌린다 |
+| Snakemake · Nextflow | 파일 의존 관계로 단계를 정한다 | Slurm 실행기가 내장돼 있다 |
+
+Airflow를 쓴다면 태스크가 직접 계산하지 않는다. 작업을 제출하고 끝날 때까지 상태만 확인한다.
+계산은 Slurm이 하고 Airflow는 순서와 재시도만 맡는 구조다.
+
+```python
+from airflow.decorators import dag, task
+from datetime import datetime
+import subprocess, time
+
+@dag(schedule="0 2 * * *", start_date=datetime(2026, 1, 1), catchup=False)
+def nightly_finetune():
+
+    @task
+    def submit_and_wait(script: str, args: str = "") -> str:
+        job = subprocess.check_output(
+            ["sbatch", "--parsable", script, *args.split()], text=True).strip()
+        while True:
+            state = subprocess.check_output(
+                ["sacct", "-j", job, "-n", "-X", "-o", "State"], text=True).strip()
+            if state.startswith(("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT")):
+                break
+            time.sleep(60)                       # 스케줄러를 자주 두드리지 않는다
+        if not state.startswith("COMPLETED"):
+            raise RuntimeError(f"{script} 가 {state} 로 끝났다")
+        return job
+
+    submit_and_wait("prep.sh") >> submit_and_wait("train.sh") >> submit_and_wait("eval.sh")
+
+nightly_finetune()
+```
+
+상태를 확인하는 주기를 짧게 잡으면 워크플로 도구가 스케줄러를 두드리는 부하가 커진다. 작업이
+몇 시간짜리라면 1분 간격으로 충분하다. 수백 개 태스크가 동시에 확인하면 그 자체가 문제가 되므로,
+확인 주기와 동시 실행 수에 상한을 둔다.
+
+워크플로 도구를 넣을지는 단계 수와 반복 여부로 정한다. 한 번 돌리고 마는 실험이라면 의존성으로
+충분하고, 매일 도는 파이프라인이라면 도구를 얹을 값어치가 있다. 도구가 늘면 장애가 났을 때
+어느 층이 원인인지 가리는 일이 하나 더 늘어난다는 점도 감안한다.
+
 ## 대기열을 나누는 기준
 
 파티션을 어떻게 자를지가 사용자 경험을 크게 바꾼다. 하나로 두면 짧은 작업이 긴 작업 뒤에서

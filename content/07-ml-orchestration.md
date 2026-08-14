@@ -599,6 +599,64 @@ avg by (hour) (
 PROMQL
 ```
 
+## GPU 소프트웨어 스택 맞추기
+
+분산 학습이 도는 데 필요한 것은 층으로 쌓여 있고, 아래층이 위층의 상한을 정한다. 한 층이라도
+어긋나면 조용히 느려지거나 시작조차 못 한다.
+
+| 층 | 무엇 | 어긋나면 |
+| --- | --- | --- |
+| 커널과 드라이버 | NVIDIA 드라이버, OFED | 장치가 안 보이거나 RDMA가 죽는다 |
+| CUDA 런타임 | 컨테이너 안의 CUDA | 드라이버보다 높으면 실행이 안 된다 |
+| 통신 라이브러리 | NCCL, UCX | 경로를 잘못 골라 TCP로 떨어진다 |
+| MPI | OpenMPI, MPICH | 프로세스가 서로를 못 찾는다 |
+| 프레임워크 | PyTorch, JAX | 빌드된 CUDA 버전과 안 맞는다 |
+
+CUDA 런타임은 드라이버보다 새로울 수 없다는 규칙이 가장 자주 걸린다. 컨테이너 이미지의 CUDA가
+12.4인데 노드 드라이버가 12.2용이면 그 노드에서만 죽는다. 노드마다 드라이버 버전이 다르면
+같은 이미지가 어떤 노드에서만 실패하는 현상이 나온다.
+
+```bash
+nvidia-smi | head -3                       # 드라이버와 지원 CUDA 버전
+nvcc --version | tail -2                   # 빌드에 쓰인 CUDA
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+ofed_info -s                               # OFED 버전
+```
+
+MPI는 노드를 넘는 프로세스를 띄우는 층이다. Slurm과 함께 쓰면 `srun`이 그 일을 대신하므로
+호스트 파일을 만들 필요가 없다. OpenMPI를 Slurm 지원으로 빌드해 두면 `srun`이 직접 띄운다.
+
+```bash
+ompi_info | grep -E "Configure command line|MCA pmix|slurm"   # Slurm 연동이 들어갔는지
+srun --mpi=list                                               # 쓸 수 있는 MPI 방식
+srun --mpi=pmix -N4 --ntasks-per-node=8 ./my_mpi_app
+```
+
+`--mpi=list`에 `pmix`가 없으면 Slurm이 MPI 지원 없이 빌드된 것이라 `mpirun`을 따로 써야 한다.
+이 경우 자원 할당과 프로세스 배치가 어긋나기 쉬우므로 가능하면 연동을 갖춘다.
+
+통신 라이브러리가 어느 경로를 골랐는지는 반드시 확인한다. 설정이 빠지면 오류 없이 TCP로 떨어져
+몇 배 느려지고, 그 상태로 몇 주를 돌리는 사고가 실제로 일어난다.
+
+```bash
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET
+srun -N2 --ntasks-per-node=8 python -c "
+import torch, torch.distributed as dist
+dist.init_process_group('nccl'); dist.all_reduce(torch.ones(1, device='cuda'))" 2>&1 | grep -E "NET/"
+```
+
+`NET/IB`가 보이면 정상이고 `NET/Socket`이면 TCP로 떨어진 것이다. 대역폭 자체는 `nccl-tests`로
+따로 잰다. 노드 수를 늘려가며 재면 어디서 꺾이는지 보인다.
+
+```bash
+srun -N8 --ntasks-per-node=8 all_reduce_perf -b 8 -e 8G -f 2 -g 1
+```
+
+버전 조합은 노드마다 같아야 한다. 한 대만 드라이버가 다르면 그 노드가 섞인 작업만 실패하고,
+원인을 찾는 데 시간이 든다. 조합을 파일로 고정하고 배포 자동화가 그 값을 강제하게 두는 편이
+안전하다. 모듈 10의 드라이버 배포 항목에서 그 방법을 정리했다.
+
 ## 무엇을 고를 것인가
 
 | 상황 | 맞는 선택 |
