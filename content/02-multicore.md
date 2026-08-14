@@ -22,6 +22,8 @@ level: 핵심
 | 95% | 9.1배 | 15.4배 | 20배 |
 | 99% | 13.9배 | 39.3배 | 100배 |
 
+![병렬 가능 비율이 99퍼센트여도 코어 32개에서 24배에 그친다](img/scaling.svg)
+
 여기서 나오는 결론은 두 가지다. 코어를 늘리기 전에 순차 구간을 먼저 줄여야 하고, 코어 수를
 두 배로 늘렸을 때 성능이 두 배가 되지 않는 것은 정상이라는 점이다.
 
@@ -87,6 +89,8 @@ export OMP_PLACES=cores        # 배치 단위는 코어
 `close`는 한 소켓에 몰아 붙여 캐시 공유가 유리하고, `spread`는 흩어 놓아 메모리 대역폭을 더
 쓴다. 대역폭에 묶인 연산은 `spread`가 나은 경우가 있다.
 
+![close는 스레드를 한 소켓에 모으고 spread는 소켓에 흩어 배치한다](img/thread-binding.svg)
+
 메모리도 함께 묶어야 효과가 난다.
 
 ```bash
@@ -119,6 +123,123 @@ srun --cpu-bind=cores ./app
 
 프로세스를 늘릴수록 통신량이 늘고, 스레드를 늘릴수록 동기화 비용과 NUMA 원격 접근이 는다.
 둘 사이 균형은 코드마다 다르므로 몇 가지 조합을 재보고 고른다.
+
+## 배치가 제대로 됐는지 확인
+
+설정을 넣었다고 적용되는 것은 아니다. 런타임이 무시하거나 스케줄러 설정과 충돌하는 경우가 있어
+실제 배치를 눈으로 확인해야 한다.
+
+```bash
+export OMP_DISPLAY_ENV=verbose      # 시작할 때 적용된 설정을 찍는다
+export OMP_DISPLAY_AFFINITY=true    # 스레드가 어느 코어에 묶였는지 찍는다
+export OMP_AFFINITY_FORMAT="thread %0.3n bound to core %A on host %H"
+```
+
+Slurm에서는 할당 자체를 확인한다.
+
+```bash
+srun --cpu-bind=verbose,cores ./app 2>&1 | head    # 어느 마스크로 묶였는지
+taskset -pc $$                                      # 현재 셸의 허용 코어
+numastat -p <pid>                                   # 노드별 메모리 사용량
+```
+
+`numastat`에서 다른 노드의 값이 크면 원격 접근이 일어나는 중이다. 첫 접근 규칙 때문에 초기화
+코드가 원인인 경우가 많다.
+
+## 동기화 비용
+
+스레드를 늘려도 안 빨라지는 두 번째 이유가 동기화다. 임계 구역과 배리어는 스레드 수에 따라
+비용이 커진다.
+
+```c
+// 나쁜 예. 매 반복마다 락을 잡는다
+#pragma omp parallel for
+for (int i = 0; i < n; i++) {
+    #pragma omp critical
+    sum += x[i];
+}
+
+// 좋은 예. 각자 모았다가 마지막에 한 번 합친다
+#pragma omp parallel for reduction(+:sum)
+for (int i = 0; i < n; i++) sum += x[i];
+```
+
+앞의 코드는 스레드를 늘릴수록 느려진다. 락을 기다리는 시간이 계산 시간을 넘기기 때문이다.
+축약은 스레드마다 지역 변수를 두고 마지막에 트리 형태로 합치므로 이 문제가 없다.
+
+배리어도 마찬가지다. 반복문이 끝날 때마다 암묵적 배리어가 걸리는데, 다음 계산이 앞의 결과에
+의존하지 않으면 없앨 수 있다.
+
+```c
+#pragma omp parallel
+{
+    #pragma omp for nowait          // 배리어를 없앤다
+    for (int i = 0; i < n; i++) a[i] = f(i);
+
+    #pragma omp for                 // 여기서는 필요하다
+    for (int i = 0; i < n; i++) b[i] = g(a[i]);
+}
+```
+
+## 거짓 공유를 눈으로 확인
+
+논리적으로 겹치지 않는 변수라도 같은 캐시 라인(보통 64바이트)에 있으면 코어끼리 그 줄을
+주고받는다. 결과는 맞지만 성능이 크게 떨어진다.
+
+```c
+// 나쁜 예. sums 원소들이 같은 캐시 라인에 몰린다
+double sums[8];
+#pragma omp parallel num_threads(8)
+{
+    int t = omp_get_thread_num();
+    for (int i = t; i < n; i += 8) sums[t] += x[i];
+}
+
+// 좋은 예. 캐시 라인 크기로 띄운다
+struct { double v; char pad[56]; } sums[8];
+```
+
+의심되면 캐시 관련 카운터로 확인한다.
+
+```bash
+perf stat -e cache-misses,cache-references,LLC-load-misses ./app
+```
+
+같은 계산인데 스레드를 늘렸을 때 캐시 미스가 급증하면 거짓 공유를 의심한다.
+
+## 작업 단위 병렬
+
+반복문으로 나누기 어려운 구조, 예를 들어 재귀나 그래프 순회는 작업 단위로 나눈다.
+
+```c
+#pragma omp parallel
+#pragma omp single
+{
+    #pragma omp task
+    process(left);
+    #pragma omp task
+    process(right);
+    #pragma omp taskwait
+}
+```
+
+작업이 너무 잘게 쪼개지면 생성 비용이 계산을 넘는다. 일정 깊이 아래로는 순차로 처리하도록
+잘라 주는 편이 낫다.
+
+## 런타임별 환경 변수
+
+같은 OpenMP라도 컴파일러 런타임에 따라 변수 이름이 다르다. 혼용하면 한쪽만 적용되어 원인을
+찾기 어려워진다.
+
+| 목적 | 표준 | GNU | Intel |
+| --- | --- | --- | --- |
+| 스레드 수 | `OMP_NUM_THREADS` | 동일 | 동일 |
+| 바인딩 | `OMP_PROC_BIND` | `GOMP_CPU_AFFINITY` | `KMP_AFFINITY` |
+| 대기 정책 | `OMP_WAIT_POLICY` | 동일 | `KMP_BLOCKTIME` |
+| 스택 크기 | `OMP_STACKSIZE` | 동일 | `KMP_STACKSIZE` |
+
+`KMP_BLOCKTIME`은 스레드가 일이 없을 때 얼마나 기다리다 잠들지 정한다. 기본값이 크면 유휴
+스레드가 CPU를 붙잡고 있어 다른 프로세스와 경합한다. MPI와 섞어 쓸 때는 줄이는 편이 낫다.
 
 ## 자주 밟는 함정
 

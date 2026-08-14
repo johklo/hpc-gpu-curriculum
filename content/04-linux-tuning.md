@@ -128,6 +128,111 @@ export NCCL_IB_HCA=mlx5_0,mlx5_1  # 쓸 HCA를 지정한다
 `NCCL_DEBUG=INFO` 로그에서 통신 경로가 `NET/Socket`으로 잡혔다면 InfiniBand를 못 쓰고 TCP로
 돌고 있다는 뜻이다. 성능이 기대의 몇 분의 일로 떨어진다.
 
+## CPU 주파수와 절전
+
+기본 배포판은 전력을 아끼는 쪽으로 설정되어 있다. 계산 노드에서는 이 설정이 지연을 만든다.
+부하가 걸릴 때까지 클럭이 낮게 유지되고, 깊은 절전 상태에서 깨어나는 데 시간이 걸린다.
+
+```bash
+cpupower frequency-info                       # 현재 거버너와 클럭 범위
+cpupower frequency-set -g performance         # 모든 코어를 성능 모드로
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+turbostat --interval 5                        # 실제 클럭과 C-state 체류 시간
+```
+
+`turbostat`의 `Busy%`가 낮은데 성능이 안 나오면 클럭이 안 올라간 것이고, `CPU%c6`가 크면 깊은
+절전에 자주 들어간다는 뜻이다. 지연에 민감한 워크로드는 절전 깊이를 제한한다.
+
+```bash
+# 부팅 파라미터로 깊은 절전을 막는다
+intel_idle.max_cstate=1 processor.max_cstate=1
+```
+
+전력 비용과 맞바꾸는 결정이라 노드 성격에 따라 다르게 둔다. 상시 학습이 도는 GPU 노드는 성능
+모드가 맞고, 유휴 시간이 긴 노드는 굳이 그럴 필요가 없다.
+
+## 인터럽트 배치
+
+네트워크 카드는 패킷을 받을 때마다 인터럽트를 건다. 이 처리가 특정 코어에 몰리면 그 코어가
+포화되어 전체 처리량이 떨어진다. 계산 스레드가 도는 코어와 겹치면 계산도 함께 방해받는다.
+
+```bash
+cat /proc/interrupts | grep mlx               # 인터럽트가 어느 코어로 가는지
+systemctl status irqbalance                   # 자동 분배 데몬
+cat /sys/class/net/eth0/device/numa_node      # NIC 이 붙은 NUMA 노드
+```
+
+원칙은 두 가지다. NIC 인터럽트는 그 NIC이 붙은 NUMA 노드의 코어로 보내고, 계산에 쓰는 코어와
+겹치지 않게 한다. 노드를 넘어가면 인터럽트 처리마다 원격 메모리 접근이 생긴다.
+
+```bash
+# 특정 인터럽트를 특정 코어에 고정한다
+echo 2 > /proc/irq/128/smp_affinity_list
+
+# 계산 코어를 커널 작업에서 떼어 놓는다 (부팅 파라미터)
+isolcpus=8-63 nohz_full=8-63 rcu_nocbs=8-63
+```
+
+`isolcpus`는 강한 도구다. 격리한 코어에는 스케줄러가 아무것도 올리지 않으므로, 그 코어를 쓰는
+프로세스를 명시적으로 배치해야 한다. 설정만 하고 배치를 안 하면 코어가 통째로 논다.
+
+## 쓰기 버퍼와 I/O 폭발
+
+체크포인트처럼 짧은 시간에 대량으로 쓰는 워크로드는 커널의 쓰기 버퍼 설정에 영향을 받는다.
+버퍼가 가득 차면 쓰기가 동기로 바뀌면서 프로세스가 멈춘다.
+
+```bash
+sysctl vm.dirty_ratio               # 이 비율을 넘으면 쓰는 쪽이 직접 내려쓴다
+sysctl vm.dirty_background_ratio    # 이 비율부터 백그라운드로 내려쓰기 시작
+sysctl vm.dirty_expire_centisecs    # 얼마나 오래된 데이터부터 내려쓸지
+```
+
+기본값은 메모리의 20퍼센트와 10퍼센트다. 메모리가 1TB인 노드라면 200GB까지 버퍼에 쌓였다가
+한꺼번에 내려간다. 이 순간 다른 I/O가 전부 밀린다. 값을 낮추면 조금씩 꾸준히 내려가 지연이
+고르게 퍼진다.
+
+```bash
+sysctl -w vm.dirty_background_ratio=3
+sysctl -w vm.dirty_ratio=10
+```
+
+## 튜닝 프로파일
+
+항목을 하나씩 만지는 대신 묶음으로 적용하는 방법도 있다. 배포판이 제공하는 프로파일은 위에서
+다룬 항목 상당수를 한 번에 설정한다.
+
+```bash
+tuned-adm list                       # 사용 가능한 프로파일
+tuned-adm active                     # 현재 적용된 것
+tuned-adm profile hpc-compute        # 계산 노드용
+tuned-adm profile latency-performance
+```
+
+프로파일을 먼저 적용하고 필요한 항목만 덧붙이는 순서가 실수가 적다. 무엇이 바뀌는지는 프로파일
+정의 파일에서 확인할 수 있다.
+
+```bash
+cat /usr/lib/tuned/hpc-compute/tuned.conf
+```
+
+## 바꾸기 전과 후를 비교
+
+설정을 바꿨으면 효과를 재야 한다. 재현 가능한 부하로 같은 조건에서 비교한다.
+
+```bash
+# 메모리 대역폭
+mpirun -np 64 stream_mpi
+
+# 지연
+perf bench sched pipe
+
+# 종합
+sar -u -r -d -n DEV 1 60 > baseline.txt
+```
+
+값이 좋아지지 않았다면 되돌린다. 설정을 쌓아 두기만 하면 나중에 문제가 생겼을 때 무엇이
+원인인지 가릴 수 없다. 바꾼 항목과 이유, 측정값을 한곳에 기록해 두는 편이 낫다.
+
 ## 다수 노드에 명령 실행
 
 노드가 수십 대면 한 대씩 SSH로 들어가는 방식은 유지되지 않는다. 병렬 실행 도구를 쓴다.
