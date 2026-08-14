@@ -1,6 +1,6 @@
 ---
 id: m2-operations
-no: "02"
+no: "03"
 title: 클러스터 운영
 subtitle: 노드 점검, 자원 관리, 모니터링
 level: 핵심

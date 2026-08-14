@@ -3,5 +3,7 @@
   "tagline": "클러스터 구성부터 스케줄링, 성능 튜닝, 장애 분석까지 순서대로 읽는 실무 문서",
   "description": "Slurm, Kubernetes, NVIDIA GPU, Linux 성능 튜닝을 다루는 HPC/GPU 인프라 운영 문서. 누구나 고칠 수 있다.",
   "repo": "https://github.com/johklo/hpc-gpu-curriculum",
-  "edit_base": "https://github.com/johklo/hpc-gpu-curriculum/edit/main/content"
+  "edit_base": "https://github.com/johklo/hpc-gpu-curriculum/edit/main/content",
+  "repo_slug": "johklo/hpc-gpu-curriculum",
+  "branch": "main"
 }

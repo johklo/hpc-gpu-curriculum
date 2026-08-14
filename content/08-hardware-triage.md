@@ -1,6 +1,6 @@
 ---
 id: m6-hardware
-no: "06"
+no: "08"
 title: 하드웨어 점검과 장애 분석
 subtitle: PCIe 링크, NVLink, Xid, DCGM
 level: 실전
@@ -139,5 +139,5 @@ nvidia-smi --query-gpu=index,clocks.sm,clocks.max.sm,temperature.gpu,power.draw 
 | `SW Thermal Slowdown` | 드라이버가 온도로 낮췄다 | 위와 같으나 여유가 조금 있다 |
 
 스로틀이 없는데 느리다면 GPU 밖을 본다. GPU 사용률이 낮으면 데이터 로더나 전처리가 병목이고,
-사용률은 높은데 처리량이 낮으면 통신이나 커널 효율 문제다. 모듈 03의 NUMA와 네트워크 항목을
+사용률은 높은데 처리량이 낮으면 통신이나 커널 효율 문제다. 모듈 04의 NUMA와 네트워크 항목을
 함께 확인한다.

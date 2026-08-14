@@ -1,6 +1,6 @@
 ---
 id: m4-scheduling
-no: "04"
+no: "06"
 title: 스케줄링
 subtitle: 토폴로지 인지 배치, 공정성, 하이브리드 운영
 level: 심화

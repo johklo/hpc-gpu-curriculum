@@ -181,3 +181,33 @@ align-items:baseline;padding:var(--space-sm) 0 var(--space-2xs);text-decoration:
 color:var(--color-ink-2);border:none}
 .rail-top:hover{color:var(--color-accent)}
 .rail-top[aria-current="true"]{color:var(--color-accent);font-weight:600}
+
+/* ---------- 문단 편집기 ---------- */
+.sec h3 .edit{margin-left:auto;font-family:var(--font-mono);font-size:var(--text-xs);
+letter-spacing:.08em;color:var(--color-muted);background:none;cursor:pointer;white-space:nowrap;
+border:var(--rule-hair) solid var(--color-rule);padding:3px 9px;line-height:1.4}
+.sec h3 .edit:hover{color:var(--color-accent);border-color:var(--color-accent)}
+.sec-alt{margin:var(--space-sm) 0 0;font-family:var(--font-mono);font-size:var(--text-xs)}
+.sec-alt a{color:var(--color-muted);text-decoration:none}
+.sec-alt a:hover{color:var(--color-accent)}
+.editor{margin:var(--space-sm) 0 0;max-width:72rem}
+.editor-area{display:block;width:100%;min-height:14rem;padding:var(--space-md);
+font-family:var(--font-mono);font-size:var(--text-sm);line-height:1.7;color:var(--color-ink);
+background:#fff;border:var(--rule-solid) solid var(--color-rule-strong);border-radius:0;
+resize:vertical;tab-size:2}
+.editor-area:focus{outline:2px solid var(--color-focus);outline-offset:1px}
+.editor-bar{display:flex;align-items:center;gap:var(--space-sm);flex-wrap:wrap;
+margin-top:var(--space-xs)}
+.editor-bar button{cursor:pointer;font-family:var(--font-mono);font-size:var(--text-xs);
+letter-spacing:.06em;padding:6px 14px;background:#fff;color:var(--color-ink);
+border:var(--rule-hair) solid var(--color-rule-strong)}
+.editor-bar button:hover{border-color:var(--color-accent);color:var(--color-accent)}
+.editor-bar .btn-main{background:var(--color-accent);color:#fff;border-color:var(--color-accent)}
+.editor-bar .btn-main:hover{color:#fff;opacity:.9}
+.editor-bar button:disabled{opacity:.5;cursor:not-allowed}
+.editor-msg{font-size:var(--text-sm)}
+.editor-msg[data-kind="ok"]{color:var(--color-stage-ga,#196632)}
+.editor-msg[data-kind="err"]{color:#9D3533}
+.editor-msg[data-kind="warn"]{color:#8A5600}
+.editor-hint{margin-left:auto;font-size:var(--text-xs);color:var(--color-muted)}
+@media (max-width:780px){.editor-hint{display:none}}

@@ -67,7 +67,7 @@ def render(text: str) -> str:
 def build() -> None:
     modules = [parse(p) for p in sorted(CONTENT.glob("*.md"))]
     SITE.mkdir(parents=True, exist_ok=True)
-    for name in ("style.css", "tokens.css", "app.js"):
+    for name in ("style.css", "tokens.css", "app.js", "editor.js"):
         (SITE / name).write_text((ROOT / "assets" / name).read_text(encoding="utf-8"), encoding="utf-8")
 
     images = SITE / "img"
@@ -94,10 +94,14 @@ def build() -> None:
         edit_url = f"{edit_base}/{module['file']}"
         sections_html = "".join(
             f'<section class="sec" id="{esc(module["id"])}--{esc(section["id"])}" '
-            f'data-search="{esc((section["title"] + " " + section["body"]).lower())}">'
+            f'data-search="{esc((section["title"] + " " + section["body"]).lower())}" '
+            f'data-file="{esc(module["file"])}" data-heading="{esc(section["title"])}">'
             f'<h3>{esc(section["title"])}'
-            f'<a class="edit" href="{esc(edit_url)}" target="_blank" rel="noopener">고치기</a></h3>'
-            f'{render(section["body"])}</section>'
+            f'<button class="edit" type="button" data-act="edit">고치기</button></h3>'
+            f'<div class="sec-body">{render(section["body"])}</div>'
+            f'<script type="text/plain" class="sec-src">{section["body"].replace("</script", "<\\/script")}</script>'
+            f'<p class="sec-alt"><a href="{esc(edit_url)}" target="_blank" rel="noopener">GitHub에서 열기</a></p>'
+            f"</section>"
             for section in module["sections"]
         )
         body.append(
@@ -123,7 +127,7 @@ def build() -> None:
 <meta property="og:description" content="{esc(CONF["description"])}">
 <link rel="stylesheet" href="style.css">
 </head><body>
-<div class="shell">
+<div class="shell" data-repo="{esc(CONF["repo_slug"])}" data-branch="{esc(CONF.get("branch","main"))}">
 <aside class="rail">
   <a class="rail-brand" href="#top">
     <span class="mark">Handbook</span>
@@ -134,7 +138,8 @@ def build() -> None:
   <ul class="rail-nav" id="rail-nav">{"".join(rail)}</ul>
   <p class="rail-foot">
     모듈 {len(modules)}개 · 문서 {total}편<br>
-    <a href="{esc(CONF["repo"])}" target="_blank" rel="noopener">저장소에서 고치기</a>
+    <a href="{esc(CONF["repo"])}" target="_blank" rel="noopener">저장소</a>
+    &middot; <a href="#" id="token-reset">토큰 지우기</a>
   </p>
 </aside>
 
@@ -149,9 +154,9 @@ def build() -> None:
     </ul>
   </header>
 
-  <p class="note">문서 제목 옆의 <b>고치기</b>를 누르면 GitHub 편집 화면이 열린다.
-  고쳐서 저장하면 변경 이력이 남고 잠시 뒤 사이트에 반영된다. 틀린 내용이나 빠진 설명은
-  직접 고치면 된다.</p>
+  <p class="note">문서 제목 옆의 <b>고치기</b>를 누르면 이 화면에서 바로 고칠 수 있다.
+  저장하면 GitHub에 변경 이력이 남고 1분쯤 뒤 사이트에 반영된다. 처음 저장할 때 한 번만
+  토큰을 넣으면 되고, 토큰은 이 브라우저에만 저장된다.</p>
 
   {"".join(body)}
 
@@ -162,6 +167,7 @@ def build() -> None:
 </main>
 </div>
 <script src="app.js"></script>
+<script src="editor.js"></script>
 </body></html>
 """
     (SITE / "index.html").write_text(page, encoding="utf-8")
